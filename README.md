@@ -1,4 +1,4 @@
-# Fullstack Minimal Scaffold
+# Weather Website using WeatherAPI
 
 ## Run Both
 
