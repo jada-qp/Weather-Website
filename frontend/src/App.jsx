@@ -9,6 +9,11 @@ const defaultLocations = ["Copenhagen", "Kyoto", "Berlin", "Dubai"];
 const maxLocations = 6;
 const maxRecent = 6;
 const defaultUnits = { temp: "c", speed: "kph" };
+const cacheTtlMs = Number(import.meta.env.VITE_CACHE_TTL_MS) || 5 * 60 * 1000;
+const throttleMs =
+  Number(import.meta.env.VITE_REQUEST_THROTTLE_MS) || 1200;
+const weatherCacheKey = "weatherCache";
+const extendedCacheKey = "extendedCache";
 
 const loadLocations = () => {
   try {
@@ -65,6 +70,50 @@ const loadRecentSearches = () => {
     // Ignore malformed stored data.
   }
   return [];
+};
+
+const parseCachedAt = (entry) => {
+  if (!entry || typeof entry !== "object") return 0;
+  if (typeof entry.cachedAt === "number") return entry.cachedAt;
+  if (typeof entry.cachedAt === "string") {
+    const parsed = Date.parse(entry.cachedAt);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  if (typeof entry.fetchedAt === "string") {
+    const parsed = Date.parse(entry.fetchedAt);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return 0;
+};
+
+const isCacheFresh = (entry) => {
+  const cachedAt = parseCachedAt(entry);
+  if (!cachedAt) return false;
+  return Date.now() - cachedAt < cacheTtlMs;
+};
+
+const pruneCache = (cache) => {
+  if (!cache || typeof cache !== "object") return {};
+  const now = Date.now();
+  return Object.entries(cache).reduce((acc, [key, value]) => {
+    const cachedAt = parseCachedAt(value);
+    if (cachedAt && now - cachedAt < cacheTtlMs) {
+      acc[key] = value;
+    }
+    return acc;
+  }, {});
+};
+
+const loadCache = (storageKey) => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
+    if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+      return pruneCache(saved);
+    }
+  } catch {
+    // Ignore malformed stored data.
+  }
+  return {};
 };
 
 const normalizeLocations = (value) =>
@@ -152,18 +201,24 @@ export default function App() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [effectOverride, setEffectOverride] = useState("");
   const [weather, setWeather] = useState(null);
-  const [weatherCache, setWeatherCache] = useState({});
+  const [weatherCache, setWeatherCache] = useState(() =>
+    loadCache(weatherCacheKey)
+  );
   const [savedTemps, setSavedTemps] = useState(() => loadSavedTemps());
   const [loadingTemps, setLoadingTemps] = useState({});
   const [extended, setExtended] = useState(false);
   const [extendedData, setExtendedData] = useState(null);
-  const [extendedCache, setExtendedCache] = useState({});
+  const [extendedCache, setExtendedCache] = useState(() =>
+    loadCache(extendedCacheKey)
+  );
   const [extendedStatus, setExtendedStatus] = useState("idle");
   const [extendedError, setExtendedError] = useState("");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const modalRef = useRef(null);
   const closeButtonRef = useRef(null);
+  const requestCooldowns = useRef({});
+  const requestInFlight = useRef({});
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
@@ -177,6 +232,14 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("savedTemps", JSON.stringify(savedTemps));
   }, [savedTemps]);
+
+  useEffect(() => {
+    localStorage.setItem(weatherCacheKey, JSON.stringify(weatherCache));
+  }, [weatherCache]);
+
+  useEffect(() => {
+    localStorage.setItem(extendedCacheKey, JSON.stringify(extendedCache));
+  }, [extendedCache]);
 
   useEffect(() => {
     localStorage.setItem("units", JSON.stringify(units));
@@ -223,6 +286,25 @@ export default function App() {
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [extended]);
+
+  const shouldThrottle = (key, force = false) => {
+    if (force) return false;
+    const now = Date.now();
+    const last = requestCooldowns.current[key] || 0;
+    if (now - last < throttleMs) return true;
+    requestCooldowns.current[key] = now;
+    return false;
+  };
+
+  const isInFlight = (key) => Boolean(requestInFlight.current[key]);
+
+  const markRequestStart = (key) => {
+    requestInFlight.current[key] = true;
+  };
+
+  const markRequestEnd = (key) => {
+    delete requestInFlight.current[key];
+  };
 
   const addRecentSearch = (value) => {
     const cleaned = value.trim();
@@ -278,21 +360,41 @@ export default function App() {
   const fetchWeather = async (location, { force = false } = {}) => {
     const cleaned = location.trim();
     if (!cleaned) return;
+    const cached = weatherCache[cleaned];
+    const isFresh = !force && cached && isCacheFresh(cached);
+    if (cached && !isCacheFresh(cached)) {
+      setWeatherCache((prev) => {
+        if (!prev[cleaned]) return prev;
+        const next = { ...prev };
+        delete next[cleaned];
+        return next;
+      });
+    }
     setGeoError("");
+    setShowSuggestions(false);
     setActiveLocation(cleaned);
-    if (!force && weatherCache[cleaned]) {
-      const cached = weatherCache[cleaned];
+    if (isFresh) {
       setWeather(cached);
       recordSavedTemp(cleaned, cached);
       addRecentSearch(cleaned);
       setStatus("ready");
       setError("");
-      setShowSuggestions(false);
+      return;
+    }
+    const throttleKey = `weather:${cleaned.toLowerCase()}`;
+    if (isInFlight(throttleKey) || shouldThrottle(throttleKey, force)) {
+      if (cached) {
+        setWeather(cached);
+        recordSavedTemp(cleaned, cached);
+        addRecentSearch(cleaned);
+        setStatus("ready");
+        setError("");
+      }
       return;
     }
     setStatus("loading");
     setError("");
-    setShowSuggestions(false);
+    markRequestStart(throttleKey);
     try {
       const response = await fetch(
         `${apiUrl}/api/weather?query=${encodeURIComponent(cleaned)}`
@@ -301,21 +403,32 @@ export default function App() {
       if (!response.ok || data.error) {
         throw new Error(data.error || "Unable to fetch weather data");
       }
-      setWeather(data);
-      setWeatherCache((prev) => ({ ...prev, [cleaned]: data }));
-      recordSavedTemp(cleaned, data);
+      const cachedData = { ...data, cachedAt: Date.now() };
+      setWeather(cachedData);
+      setWeatherCache((prev) => ({ ...prev, [cleaned]: cachedData }));
+      recordSavedTemp(cleaned, cachedData);
       addRecentSearch(cleaned);
       setStatus("ready");
     } catch (err) {
       setStatus("error");
       setError(err.message || "Unable to fetch weather data");
+    } finally {
+      markRequestEnd(throttleKey);
     }
   };
 
   const fetchQuickTemperature = async (location) => {
     const cleaned = location.trim();
     if (!cleaned) return;
+    const cached = weatherCache[cleaned];
+    if (isCacheFresh(cached)) {
+      recordSavedTemp(cleaned, cached);
+      return;
+    }
+    const throttleKey = `quick:${cleaned.toLowerCase()}`;
+    if (isInFlight(throttleKey) || shouldThrottle(throttleKey)) return;
     setLoadingTemps((prev) => ({ ...prev, [cleaned]: true }));
+    markRequestStart(throttleKey);
     try {
       const response = await fetch(
         `${apiUrl}/api/weather?query=${encodeURIComponent(cleaned)}`
@@ -324,11 +437,13 @@ export default function App() {
       if (!response.ok || data?.error) {
         throw new Error(data?.error || "Unable to fetch weather data");
       }
-      setWeatherCache((prev) => ({ ...prev, [cleaned]: data }));
-      recordSavedTemp(cleaned, data);
+      const cachedData = { ...data, cachedAt: Date.now() };
+      setWeatherCache((prev) => ({ ...prev, [cleaned]: cachedData }));
+      recordSavedTemp(cleaned, cachedData);
     } catch {
     } finally {
       setLoadingTemps((prev) => ({ ...prev, [cleaned]: false }));
+      markRequestEnd(throttleKey);
     }
   };
 
@@ -336,25 +451,48 @@ export default function App() {
     const cleaned = location.trim();
     if (!cleaned) return;
     const cached = weatherCache[cleaned];
-    if (!cached) return;
-    setActiveLocation(cleaned);
-    setWeather(cached);
-    addRecentSearch(cleaned);
-    setStatus("ready");
-    setError("");
+    if (cached && isCacheFresh(cached)) {
+      setActiveLocation(cleaned);
+      setWeather(cached);
+      addRecentSearch(cleaned);
+      setStatus("ready");
+      setError("");
+      return;
+    }
+    fetchWeather(cleaned, { force: true });
   };
 
   const fetchExtended = async (location, { force = false } = {}) => {
     const cleaned = location.trim();
     if (!cleaned) return;
-    if (!force && extendedCache[cleaned]) {
-      setExtendedData(extendedCache[cleaned]);
+    const cached = extendedCache[cleaned];
+    const isFresh = !force && cached && isCacheFresh(cached);
+    if (cached && !isCacheFresh(cached)) {
+      setExtendedCache((prev) => {
+        if (!prev[cleaned]) return prev;
+        const next = { ...prev };
+        delete next[cleaned];
+        return next;
+      });
+    }
+    if (isFresh) {
+      setExtendedData(cached);
       setExtendedStatus("ready");
       setExtendedError("");
       return;
     }
+    const throttleKey = `extended:${cleaned.toLowerCase()}`;
+    if (isInFlight(throttleKey) || shouldThrottle(throttleKey, force)) {
+      if (cached) {
+        setExtendedData(cached);
+        setExtendedStatus("ready");
+        setExtendedError("");
+      }
+      return;
+    }
     setExtendedStatus("loading");
     setExtendedError("");
+    markRequestStart(throttleKey);
     try {
       const response = await fetch(
         `${apiUrl}/api/weather/extended?query=${encodeURIComponent(cleaned)}`
@@ -363,12 +501,15 @@ export default function App() {
       if (!response.ok || data.error) {
         throw new Error(data.error || "Unable to fetch extended weather data");
       }
-      setExtendedData(data);
-      setExtendedCache((prev) => ({ ...prev, [cleaned]: data }));
+      const cachedData = { ...data, cachedAt: Date.now() };
+      setExtendedData(cachedData);
+      setExtendedCache((prev) => ({ ...prev, [cleaned]: cachedData }));
       setExtendedStatus("ready");
     } catch (err) {
       setExtendedStatus("error");
       setExtendedError(err.message || "Unable to fetch extended weather data");
+    } finally {
+      markRequestEnd(throttleKey);
     }
   };
 
@@ -463,13 +604,15 @@ export default function App() {
         <div className="absolute bottom-0 left-0 h-64 w-64 rounded-full bg-emerald-200/30 blur-3xl animate-float-slow dark:bg-emerald-400/10" />
       </div>
 
-      <div className="relative z-10 mx-auto w-full max-w-5xl px-4 pt-6 sm:px-6 sm:pt-8">
+      <div className="relative z-10 mx-auto w-full max-w-5xl px-4 pt-4 sm:px-6 sm:pt-8">
         <nav
           aria-label="Location switcher"
-          className="flex flex-col items-start justify-between gap-3 rounded-3xl border border-stone-200 bg-white/70 px-4 py-3 text-xs uppercase tracking-[0.35em] text-stone-500 shadow-sm backdrop-blur-md animate-fade-in transition hover:-translate-y-0.5 hover:shadow-md sm:flex-row sm:items-center sm:gap-4 sm:rounded-full sm:px-5 dark:border-stone-800 dark:bg-neutral-900/70 dark:text-stone-400"
+          className="flex flex-col items-center justify-between gap-3 rounded-3xl border border-stone-200 bg-white/70 px-4 py-3 text-center text-xs uppercase tracking-[0.35em] text-stone-500 shadow-sm backdrop-blur-md animate-fade-in transition hover:-translate-y-0.5 hover:shadow-md sm:flex-row sm:items-center sm:gap-4 sm:rounded-full sm:px-5 sm:text-left dark:border-stone-800 dark:bg-neutral-900/70 dark:text-stone-400"
         >
-          <span className="text-[10px] tracking-[0.4em]">Locations</span>
-          <div className="flex w-full flex-wrap gap-2 sm:w-auto">
+          <span className="w-full text-[10px] tracking-[0.4em] sm:w-auto">
+            Locations
+          </span>
+          <div className="flex w-full flex-wrap justify-center gap-2 sm:w-auto sm:justify-start">
             {quickLocations.map((location) => {
               const isActive = activeLocation === location;
               return (
@@ -578,66 +721,68 @@ export default function App() {
             </div>
           </div>
         </div>
-        <div className="flex w-full flex-wrap items-center justify-start gap-2 sm:w-auto sm:justify-end">
-          <div className="flex w-full overflow-hidden rounded-full border border-stone-300 text-[10px] uppercase tracking-[0.3em] text-stone-600 sm:w-auto dark:border-stone-700 dark:text-stone-300">
-            <button
-              type="button"
-              onClick={() =>
-                setUnits((prev) => ({ ...prev, temp: "c" }))
-              }
-              aria-pressed={units.temp === "c"}
-              className={`px-3 py-2 transition ${
-                units.temp === "c"
-                  ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
-                  : "hover:bg-stone-100 dark:hover:bg-stone-800"
-              }`}
-            >
-              C
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                setUnits((prev) => ({ ...prev, temp: "f" }))
-              }
-              aria-pressed={units.temp === "f"}
-              className={`px-3 py-2 transition ${
-                units.temp === "f"
-                  ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
-                  : "hover:bg-stone-100 dark:hover:bg-stone-800"
-              }`}
-            >
-              F
-            </button>
-          </div>
-          <div className="flex w-full overflow-hidden rounded-full border border-stone-300 text-[10px] uppercase tracking-[0.25em] text-stone-600 sm:w-auto dark:border-stone-700 dark:text-stone-300">
-            <button
-              type="button"
-              onClick={() =>
-                setUnits((prev) => ({ ...prev, speed: "kph" }))
-              }
-              aria-pressed={units.speed === "kph"}
-              className={`px-3 py-2 transition ${
-                units.speed === "kph"
-                  ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
-                  : "hover:bg-stone-100 dark:hover:bg-stone-800"
-              }`}
-            >
-              km/h
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                setUnits((prev) => ({ ...prev, speed: "mph" }))
-              }
-              aria-pressed={units.speed === "mph"}
-              className={`px-3 py-2 transition ${
-                units.speed === "mph"
-                  ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
-                  : "hover:bg-stone-100 dark:hover:bg-stone-800"
-              }`}
-            >
-              mph
-            </button>
+        <div className="grid w-full gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center sm:justify-end">
+          <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:gap-2">
+            <div className="flex w-full overflow-hidden rounded-full border border-stone-300 text-[10px] uppercase tracking-[0.3em] text-stone-600 dark:border-stone-700 dark:text-stone-300">
+              <button
+                type="button"
+                onClick={() =>
+                  setUnits((prev) => ({ ...prev, temp: "c" }))
+                }
+                aria-pressed={units.temp === "c"}
+                className={`px-3 py-2 transition ${
+                  units.temp === "c"
+                    ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
+                    : "hover:bg-stone-100 dark:hover:bg-stone-800"
+                }`}
+              >
+                C
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setUnits((prev) => ({ ...prev, temp: "f" }))
+                }
+                aria-pressed={units.temp === "f"}
+                className={`px-3 py-2 transition ${
+                  units.temp === "f"
+                    ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
+                    : "hover:bg-stone-100 dark:hover:bg-stone-800"
+                }`}
+              >
+                F
+              </button>
+            </div>
+            <div className="flex w-full overflow-hidden rounded-full border border-stone-300 text-[10px] uppercase tracking-[0.25em] text-stone-600 dark:border-stone-700 dark:text-stone-300">
+              <button
+                type="button"
+                onClick={() =>
+                  setUnits((prev) => ({ ...prev, speed: "kph" }))
+                }
+                aria-pressed={units.speed === "kph"}
+                className={`px-3 py-2 transition ${
+                  units.speed === "kph"
+                    ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
+                    : "hover:bg-stone-100 dark:hover:bg-stone-800"
+                }`}
+              >
+                km/h
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setUnits((prev) => ({ ...prev, speed: "mph" }))
+                }
+                aria-pressed={units.speed === "mph"}
+                className={`px-3 py-2 transition ${
+                  units.speed === "mph"
+                    ? "bg-stone-900 text-stone-50 dark:bg-stone-50 dark:text-stone-900"
+                    : "hover:bg-stone-100 dark:hover:bg-stone-800"
+                }`}
+              >
+                mph
+              </button>
+            </div>
           </div>
           <button
             type="button"
@@ -649,9 +794,9 @@ export default function App() {
         </div>
       </header>
 
-      <main className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-16 px-4 pb-16 pt-6 sm:px-6">
+      <main className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-10 px-4 pb-16 pt-4 sm:gap-16 sm:px-6 sm:pt-6">
         <section className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr]">
-          <div className="space-y-6 animate-fade-up">
+          <div className="order-2 space-y-6 animate-fade-up lg:order-1">
             <p className="text-xs uppercase tracking-[0.35em] text-stone-500 dark:text-stone-400">
               Live Weather
             </p>
@@ -754,7 +899,7 @@ export default function App() {
             </form>
           </div>
 
-          <div className="rounded-3xl border border-stone-200 bg-white/70 p-8 shadow-lg backdrop-blur-md animate-fade-in dark:border-stone-800 dark:bg-neutral-900/70">
+          <div className="order-1 rounded-3xl border border-stone-200 bg-white/70 p-8 shadow-lg backdrop-blur-md animate-fade-in lg:order-2 dark:border-stone-800 dark:bg-neutral-900/70">
             {status === "loading" ? (
               <div className="space-y-6 animate-pulse">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -866,7 +1011,7 @@ export default function App() {
               {quickLocations.map((location) => {
                 const saved = savedTemps[location];
                 const cached = weatherCache[location];
-                const hasCachedWeather = Boolean(cached);
+                const hasCachedWeather = Boolean(cached && isCacheFresh(cached));
                 const tempValue = saved?.temperature;
                 const updatedLabel = formatUpdatedAt(saved?.fetchedAt);
                 const isLoading = loadingTemps[location];
