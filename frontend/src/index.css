@@ -123,18 +123,20 @@ html.dark .weather-bg-mist {
 }
 
 .weather-effect--rain .weather-effect__layer {
+  opacity: 0.5;
   background-image: repeating-linear-gradient(
     120deg,
     rgba(15, 23, 42, 0) 0,
     rgba(15, 23, 42, 0) 60%,
-    rgba(15, 23, 42, 0.35) 61%,
-    rgba(15, 23, 42, 0.35) 62%
+    rgba(15, 23, 42, 0.5) 61%,
+    rgba(15, 23, 42, 0.5) 62%
   );
   background-size: 160px 240px;
   animation: rain-fall 0.9s linear infinite;
 }
 
 .weather-effect--rain .weather-effect__layer--secondary {
+  opacity: 0.28;
   background-size: 220px 300px;
   animation-duration: 1.4s;
 }
