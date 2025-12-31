@@ -6,6 +6,52 @@ const app = express();
 const port = process.env.PORT || 3001;
 const weatherApiBaseUrl =
   process.env.WEATHERAPI_BASE_URL || "http://api.weatherapi.com/v1";
+const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60000;
+const rateLimitMax = Math.max(1, Number(process.env.RATE_LIMIT_MAX) || 5);
+const rateLimitStore = new Map();
+const rateLimitMessage = "Too many requests, please try again later.";
+
+const getClientIp = (req) => {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.length) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.ip || req.connection?.remoteAddress || "unknown";
+};
+
+const shouldRateLimit = (req) => req.path.startsWith("/api/weather");
+
+const pruneRateLimitStore = (now) => {
+  if (rateLimitStore.size < 1000) return;
+  for (const [key, value] of rateLimitStore) {
+    if (now > value.resetTime) {
+      rateLimitStore.delete(key);
+    }
+  }
+};
+
+const rateLimit = (req, res, next) => {
+  if (!shouldRateLimit(req)) return next();
+  const now = Date.now();
+  pruneRateLimitStore(now);
+  const ip = getClientIp(req);
+  const entry = rateLimitStore.get(ip);
+  if (!entry || now > entry.resetTime) {
+    rateLimitStore.set(ip, { count: 1, resetTime: now + rateLimitWindowMs });
+    return next();
+  }
+  if (entry.count >= rateLimitMax) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((entry.resetTime - now) / 1000)
+    );
+    res.set("Retry-After", String(retryAfterSeconds));
+    return res.status(429).json({ error: rateLimitMessage });
+  }
+  entry.count += 1;
+  return next();
+};
+
 
 const normalizeIconUrl = (icon) => {
   if (!icon) return "";
@@ -61,6 +107,7 @@ const mapHistoryDay = (day) => ({
 
 app.use(cors());
 app.use(express.json());
+app.use(rateLimit);
 
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
