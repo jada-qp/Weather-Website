@@ -90,6 +90,8 @@ export default function App() {
   const [activeLocation, setActiveLocation] = useState(defaultLocation);
   const [input, setInput] = useState(defaultLocation);
   const [newLocation, setNewLocation] = useState("");
+  const [isAddingLocation, setIsAddingLocation] = useState(false);
+  const [effectOverride, setEffectOverride] = useState("");
   const [weather, setWeather] = useState(null);
   const [weatherCache, setWeatherCache] = useState({});
   const [savedTemps, setSavedTemps] = useState(() => loadSavedTemps());
@@ -188,6 +190,17 @@ export default function App() {
     }
   };
 
+  const showCachedWeather = (location) => {
+    const cleaned = location.trim();
+    if (!cleaned) return;
+    const cached = weatherCache[cleaned];
+    if (!cached) return;
+    setActiveLocation(cleaned);
+    setWeather(cached);
+    setStatus("ready");
+    setError("");
+  };
+
   const fetchExtended = async (location, { force = false } = {}) => {
     const cleaned = location.trim();
     if (!cleaned) return;
@@ -232,6 +245,7 @@ export default function App() {
   const precip = weather?.current?.precip;
   const lastUpdatedLabel = formatUpdatedAt(weather?.fetchedAt);
   const weatherEffect = getWeatherEffect(description);
+  const activeEffect = effectOverride || weatherEffect;
 
   const metrics = [
     {
@@ -251,10 +265,10 @@ export default function App() {
 
   return (
     <div
-      className={`relative min-h-screen overflow-hidden text-stone-900 transition-colors duration-300 dark:text-stone-100 weather-bg-${weatherEffect}`}
+      className={`relative min-h-screen overflow-hidden text-stone-900 transition-colors duration-300 dark:text-stone-100 weather-bg-${activeEffect}`}
     >
       <div
-        className={`pointer-events-none absolute inset-0 weather-effect weather-effect--${weatherEffect}`}
+        className={`pointer-events-none absolute inset-0 weather-effect weather-effect--${activeEffect}`}
         aria-hidden="true"
       >
         <div className="weather-effect__layer" />
@@ -510,33 +524,6 @@ export default function App() {
           </div>
         </section>
 
-        <section className="grid gap-6 md:grid-cols-3">
-          {[
-            {
-              title: "Minimal readings",
-              detail: "Only the essential signals, presented with clarity.",
-            },
-            {
-              title: "Soft transitions",
-              detail: "Subtle motion keeps the interface feeling steady.",
-            },
-            {
-              title: "Always available",
-              detail: "WeatherAPI data streams through a simple backend relay.",
-            },
-          ].map((item) => (
-            <div
-              key={item.title}
-              className="rounded-2xl border border-stone-200 bg-white/60 p-6 text-sm text-stone-600 shadow-sm transition hover:-translate-y-1 hover:border-stone-300 hover:shadow-md dark:border-stone-800 dark:bg-neutral-900/70 dark:text-stone-300"
-            >
-              <h3 className="mb-3 text-base font-semibold text-stone-900 dark:text-stone-100">
-                {item.title}
-              </h3>
-              <p>{item.detail}</p>
-            </div>
-          ))}
-        </section>
-
         <section className="space-y-4">
           <p className="text-xs uppercase tracking-[0.3em] text-stone-500 dark:text-stone-400">
             Default cities
@@ -544,6 +531,8 @@ export default function App() {
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               {quickLocations.map((location) => {
                 const saved = savedTemps[location];
+                const cached = weatherCache[location];
+                const hasCachedWeather = Boolean(cached);
                 const tempValue = saved?.temperature;
                 const updatedLabel = formatUpdatedAt(saved?.fetchedAt);
                 const isLoading = loadingTemps[location];
@@ -565,15 +554,16 @@ export default function App() {
                         type="button"
                         onClick={() => {
                           setInput(location);
-                          fetchWeather(location);
+                          showCachedWeather(location);
                         }}
-                        className="rounded-full border border-stone-300 px-3 py-2 text-[10px] uppercase tracking-[0.3em] text-stone-600 transition hover:border-stone-500 hover:text-stone-900 dark:border-stone-700 dark:text-stone-300 dark:hover:border-stone-400"
+                        disabled={!hasCachedWeather}
+                        className="rounded-full border border-stone-300 px-3 py-2 text-[10px] uppercase tracking-[0.3em] text-stone-600 transition hover:border-stone-500 hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-stone-700 dark:text-stone-300 dark:hover:border-stone-400"
                       >
                         View
                       </button>
                     </div>
                     <p className="mt-3 text-[10px] uppercase tracking-[0.3em] text-stone-400 dark:text-stone-500">
-                      {updatedLabel ? `Last update ${updatedLabel}` : "Not loaded yet"}
+                      {updatedLabel ? `Last update ${updatedLabel}` : "Load to enable view"}
                     </p>
                     <button
                       type="button"
@@ -590,44 +580,81 @@ export default function App() {
                   </div>
                 );
               })}
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                const cleaned = newLocation.trim();
-                if (!cleaned || isAtMaxLocations) return;
-                setQuickLocations((prev) => {
-                  const exists = prev.some(
-                    (item) => item.toLowerCase() === cleaned.toLowerCase()
-                  );
-                  if (exists) return prev;
-                  return [...prev, cleaned].slice(0, maxLocations);
-                });
-                setNewLocation("");
-              }}
-              className="rounded-2xl border border-dashed border-stone-300 bg-white/50 p-5 text-left text-sm text-stone-600 shadow-sm dark:border-stone-700 dark:bg-neutral-900/60 dark:text-stone-300"
-            >
-              <p className="text-[10px] uppercase tracking-[0.3em] text-stone-500 dark:text-stone-400">
-                Add city
-              </p>
-              <input
-                type="text"
-                value={newLocation}
-                onChange={(event) => setNewLocation(event.target.value)}
-                placeholder="Reykjavik"
-                disabled={isAtMaxLocations}
-                className="mt-3 w-full rounded-full border border-stone-300 bg-white/70 px-4 py-2 text-xs tracking-[0.2em] text-stone-700 shadow-sm transition focus:border-stone-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:border-stone-700 dark:bg-neutral-900/60 dark:text-stone-100 dark:focus:border-stone-400"
-              />
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
               <button
-                type="submit"
+                type="button"
                 disabled={isAtMaxLocations}
-                className="mt-3 inline-flex rounded-full border border-stone-300 px-4 py-2 text-[10px] uppercase tracking-[0.35em] transition hover:border-stone-500 hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-stone-700 dark:text-stone-300 dark:hover:border-stone-400"
+                onClick={() => setIsAddingLocation((value) => !value)}
+                className="rounded-full border border-stone-300 px-4 py-2 text-[10px] uppercase tracking-[0.35em] transition hover:border-stone-500 hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-stone-700 dark:text-stone-300 dark:hover:border-stone-400"
               >
-                Add
+                {isAddingLocation ? "Close" : "Add City"}
               </button>
-              <p className="mt-2 text-[10px] uppercase tracking-[0.3em] text-stone-400 dark:text-stone-500">
+              <p className="text-[10px] uppercase tracking-[0.3em] text-stone-400 dark:text-stone-500">
                 {isAtMaxLocations ? "Limit reached" : `Up to ${maxLocations} cities`}
               </p>
-            </form>
+            </div>
+            {isAddingLocation && !isAtMaxLocations ? (
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const cleaned = newLocation.trim();
+                  if (!cleaned) return;
+                  setQuickLocations((prev) => {
+                    const exists = prev.some(
+                      (item) => item.toLowerCase() === cleaned.toLowerCase()
+                    );
+                    if (exists) return prev;
+                    return [...prev, cleaned].slice(0, maxLocations);
+                  });
+                  setNewLocation("");
+                  setIsAddingLocation(false);
+                }}
+                className="flex flex-wrap items-center gap-3"
+              >
+                <input
+                  type="text"
+                  value={newLocation}
+                  onChange={(event) => setNewLocation(event.target.value)}
+                  placeholder="Reykjavik"
+                  className="w-full flex-1 rounded-full border border-stone-300 bg-white/70 px-4 py-2 text-xs tracking-[0.2em] text-stone-700 shadow-sm transition focus:border-stone-500 focus:outline-none dark:border-stone-700 dark:bg-neutral-900/60 dark:text-stone-100 dark:focus:border-stone-400"
+                />
+                <button
+                  type="submit"
+                  className="rounded-full border border-stone-300 px-4 py-2 text-[10px] uppercase tracking-[0.35em] transition hover:border-stone-500 hover:text-stone-900 dark:border-stone-700 dark:text-stone-300 dark:hover:border-stone-400"
+                >
+                  Add
+                </button>
+              </form>
+            ) : null}
+        </section>
+
+        <section className="space-y-4">
+          <p className="text-xs uppercase tracking-[0.3em] text-stone-500 dark:text-stone-400">
+            Testing effects
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {[
+              { id: "", label: "Auto" },
+              { id: "clear", label: "Clear" },
+              { id: "clouds", label: "Clouds" },
+              { id: "rain", label: "Rain" },
+              { id: "snow", label: "Snow" },
+              { id: "mist", label: "Mist" },
+            ].map((effect) => (
+              <button
+                key={effect.label}
+                type="button"
+                onClick={() => setEffectOverride(effect.id)}
+                className={`rounded-full border px-4 py-2 text-[10px] uppercase tracking-[0.35em] transition hover:border-stone-500 hover:text-stone-900 dark:hover:border-stone-400 ${
+                  (effectOverride || "") === effect.id
+                    ? "border-stone-500 text-stone-900 dark:border-stone-400 dark:text-stone-100"
+                    : "border-stone-300 text-stone-600 dark:border-stone-700 dark:text-stone-300"
+                }`}
+              >
+                {effect.label}
+              </button>
+            ))}
           </div>
         </section>
       </main>
